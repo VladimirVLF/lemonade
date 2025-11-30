@@ -20,14 +20,12 @@ public:
         
         void print() const {
             if (input_tokens > 0 || output_tokens > 0) {
-                std::cout << "\n=== Telemetry ===" << std::endl;
-                std::cout << "Input tokens:  " << input_tokens << std::endl;
-                std::cout << "Output tokens: " << output_tokens << std::endl;
-                std::cout << "TTFT (s):      " << std::fixed << std::setprecision(3) 
-                          << time_to_first_token << std::endl;
-                std::cout << "TPS:           " << std::fixed << std::setprecision(2) 
-                          << tokens_per_second << std::endl;
-                std::cout << "=================" << std::endl;
+                std::cout << "[StreamingProxy] === Telemetry ===" << std::endl;
+                std::cout << "[StreamingProxy] Input tokens:  " << input_tokens << std::endl;
+                std::cout << "[StreamingProxy] Output tokens: " << output_tokens << std::endl;
+                std::cout << "[StreamingProxy] TTFT (s):      " << std::fixed << std::setprecision(2) << time_to_first_token << std::endl;
+                std::cout << "[StreamingProxy] TPS:           " << std::fixed << std::setprecision(2) << tokens_per_second << std::endl;
+                std::cout << "[StreamingProxy] =================" << std::endl;
             }
         }
     };

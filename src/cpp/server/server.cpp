@@ -49,43 +49,58 @@ Server::Server(int port, const std::string& host, const std::string& log_level,
     // CRITICAL: Enable multi-threading so the server can handle concurrent requests
     // Without this, the server is single-threaded and blocks on long operations
     http_server_->new_task_queue = [this] { 
-        debug_log("Creating new thread pool with 8 threads");
+        log_debug("Creating new thread pool with 8 threads");
         return new httplib::ThreadPool(8);
     };
     
-    std::cout << "[Server] HTTP server initialized with thread pool (8 threads)" << std::endl;
-    
+    // Log every HTTP request _before_ handling
+    http_server_->set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
+        log_info(req.method + " " + req.target);
+        return httplib::Server::HandlerResponse::Unhandled;
+    });
+
+    setup_cors();          // Setup CORS for all routes
+    setup_routes();        // Setup routes/endpoints
+    setup_static_files();  // Static file serving for web UI
+
+    log_info("HTTP server initialized with thread pool (8 threads)");
+    log_debug("Debug logging enabled - subprocess output will be visible");
+
     model_manager_ = std::make_unique<ModelManager>();
     router_ = std::make_unique<Router>(ctx_size, llamacpp_backend, log_level, llamacpp_args, 
                                        model_manager_.get(), max_llm_models, 
                                        max_embedding_models, max_reranking_models);
-    
-    debug_log("Debug logging enabled - subprocess output will be visible");
-    
-    setup_routes();
 }
 
 Server::~Server() {
     stop();
 }
 
-void Server::debug_log(const std::string& msg) {
+void Server::log_debug(const std::string& msg) {
     if (log_level_ == "debug" || log_level_ == "trace") {
-        std::cout << "[Server DEBUG] " << msg << std::endl;
+        std::cout << "[Server DEBUG] " << msg << std::endl << std::flush;
     }
 }
 
-void Server::setup_routes() {
-    // Add pre-routing handler to log ALL incoming requests
-    http_server_->set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
-        debug_log("PRE-ROUTE: " + req.method + " " + req.path);
-        std::cout.flush();
-        return httplib::Server::HandlerResponse::Unhandled;
-    });
-    
-    // Setup CORS for all routes
-    setup_cors();
-    
+void Server::log_info(const std::string& msg) {
+    if (log_level_ == "info" || log_level_ == "debug" || log_level_ == "trace") {
+        std::cout << "[Server] " << msg << std::endl << std::flush;
+    }
+}
+
+void Server::log_warning(const std::string& msg) {
+    if (log_level_ != "error" && log_level_ != "warning") {
+        return;
+    }
+
+    std::cout << "[Server WARNING] " << msg << std::endl << std::flush;
+}
+
+void Server::log_error(const std::string& msg) {
+    std::cerr << "[Server ERROR] " << msg << std::endl << std::flush;
+}
+
+void Server::setup_routes() {    
     // Helper lambda to register routes for both v0 and v1
     auto register_get = [this](const std::string& endpoint, 
                                std::function<void(const httplib::Request&, httplib::Response&)> handler) {
@@ -204,15 +219,11 @@ void Server::setup_routes() {
     });
     
     // Test endpoint to verify POST works
-    http_server_->Post("/api/v1/test", [](const httplib::Request& req, httplib::Response& res) {
-        std::cout << "[Server] TEST POST endpoint hit!" << std::endl;
+    http_server_->Post("/api/v1/test", [this](const httplib::Request& req, httplib::Response& res) {
         res.set_content("{\"test\": \"ok\"}", "application/json");
     });
     
-    // Setup static file serving for web UI
-    setup_static_files();
-    
-    std::cout << "[Server] Routes setup complete" << std::endl;
+    log_info("Routes setup complete");
 }
 
 void Server::setup_static_files() {
@@ -230,7 +241,7 @@ void Server::setup_static_files() {
         std::ifstream file(webapp_path);
         
         if (!file.is_open()) {
-            std::cerr << "[Server] Could not open webapp.html at: " << webapp_path << std::endl;
+            log_error("Could not open webapp.html at: " + webapp_path);
             res.status = 404;
             res.set_content("{\"error\": \"webapp.html not found\"}", "application/json");
             return;
@@ -305,10 +316,10 @@ void Server::setup_static_files() {
     // Mount static files directory for other files (CSS, JS, images)
     // Use /static prefix to avoid conflicts with webapp.html
     if (!http_server_->set_mount_point("/static", static_dir)) {
-        std::cerr << "[Server WARNING] Could not mount static files from: " << static_dir << std::endl;
-        std::cerr << "[Server] Web UI assets will not be available" << std::endl;
+        log_warning("Could not mount static files from: " + static_dir);
+        log_warning("Web UI assets will not be available");
     } else {
-        std::cout << "[Server] Static files mounted from: " << static_dir << std::endl;
+        log_info("Static files mounted from: " + static_dir);
     }
     
     // Override default headers for static files to include no-cache
@@ -335,8 +346,8 @@ void Server::setup_cors() {
     });
     
     // Catch-all error handler - must be last!
-    http_server_->set_error_handler([](const httplib::Request& req, httplib::Response& res) {
-        std::cerr << "[Server] Error " << res.status << ": " << req.method << " " << req.path << std::endl;
+    http_server_->set_error_handler([this](const httplib::Request& req, httplib::Response& res) {
+        log_error(std::to_string(res.status) + ": " + req.method + " " + req.path);
         
         if (res.status == 404) {
             nlohmann::json error = {
@@ -349,8 +360,9 @@ void Server::setup_cors() {
             res.set_content(error.dump(), "application/json");
         } else if (res.status == 400) {
             // Log more details about 400 errors
-            std::cerr << "[Server] 400 Bad Request details - Body length: " << req.body.length() 
-                      << ", Content-Type: " << req.get_header_value("Content-Type") << std::endl;
+            log_error("400 Bad Request details - Body length: "
+                + std::to_string(req.body.length()) + ", Content-Type: "
+                + req.get_header_value("Content-Type"));
             // Ensure a response is sent
             if (res.body.empty()) {
                 nlohmann::json error = {
@@ -366,12 +378,7 @@ void Server::setup_cors() {
 }
 
 void Server::run() {
-    std::cout << "[Server] Starting on " << host_ << ":" << port_ << std::endl;
-    
-    // Add request logging for ALL requests
-    http_server_->set_logger([](const httplib::Request& req, const httplib::Response& res) {
-        std::cout << "[Server] " << req.method << " " << req.path << " - " << res.status << std::endl;
-    });
+    log_info("Starting on " + host_ + ":" + std::to_string(port_));
     
     running_ = true;
     http_server_->listen(host_, port_);
@@ -379,20 +386,20 @@ void Server::run() {
 
 void Server::stop() {
     if (running_) {
-        std::cout << "[Server] Stopping HTTP server..." << std::endl;
+        log_info("Stopping HTTP server...");
         http_server_->stop();
         running_ = false;
         
         // Explicitly clean up router (unload models, stop backend servers)
         if (router_) {
-            std::cout << "[Server] Unloading models and stopping backend servers..." << std::endl;
+            log_info("Unloading models and stopping backend servers...");
             try {
                 router_->unload_model();
             } catch (const std::exception& e) {
-                std::cerr << "[Server] Error during cleanup: " << e.what() << std::endl;
+                log_error("Error during cleanup: " + std::string(e.what()));
             }
         }
-        std::cout << "[Server] Cleanup complete" << std::endl;
+        log_info("Cleanup complete");
     }
 }
 
@@ -416,12 +423,12 @@ bool Server::is_running() const {
 void Server::auto_load_model_if_needed(const std::string& requested_model) {
     // Check if this specific model is already loaded (multi-model aware)
     if (router_->is_model_loaded(requested_model)) {
-        std::cout << "[Server] Model already loaded: " << requested_model << std::endl;
+        log_info("Model already loaded: " + requested_model);
         return;
     }
     
     // Log the auto-loading action
-    std::cout << "[Server] Auto-loading model: " << requested_model << std::endl;
+    log_info("Auto-loading model: " + requested_model);
     
     // Get model info
     if (!model_manager_->model_exists(requested_model)) {
@@ -437,10 +444,10 @@ void Server::auto_load_model_if_needed(const std::string& requested_model) {
     //   - If model IS downloaded: Skip HuggingFace API check entirely (use cached version)
     // Only the /pull endpoint should check for updates (uses do_not_upgrade=false)
     if (info.recipe != "flm" && !model_manager_->is_model_downloaded(requested_model)) {
-        std::cout << "[Server] Model not cached, downloading from Hugging Face..." << std::endl;
-        std::cout << "[Server] This may take several minutes for large models." << std::endl;
+        log_info("Model not cached, downloading from Hugging Face...");
+        log_info("This may take several minutes for large models.");
         model_manager_->download_model(requested_model, "", "", false, false, "", true);
-        std::cout << "[Server] Model download complete: " << requested_model << std::endl;
+        log_info("Model download complete: " + requested_model);
         
         // CRITICAL: Refresh model info after download to get correct resolved_path
         // The resolved_path is computed based on filesystem, so we need fresh info now that files exist
@@ -451,7 +458,7 @@ void Server::auto_load_model_if_needed(const std::string& requested_model) {
     // For FLM models: FastFlowLMServer will handle download internally if needed
     // For non-FLM models: Model should already be cached at this point
     router_->load_model(requested_model, info, true);
-    std::cout << "[Server] Model loaded successfully: " << requested_model << std::endl;
+    log_info("Model loaded successfully: " + requested_model);
 }
 
 void Server::handle_health(const httplib::Request& req, httplib::Response& res) {
@@ -567,10 +574,10 @@ void Server::handle_chat_completions(const httplib::Request& req, httplib::Respo
         
         // Debug: Check if tools are present
         if (request_json.contains("tools")) {
-            debug_log("Tools present in request: " + std::to_string(request_json["tools"].size()) + " tool(s)");
-            debug_log("Tools JSON: " + request_json["tools"].dump());
+            log_debug("Tools present in request: " + std::to_string(request_json["tools"].size()) + " tool(s)");
+            log_debug("Tools JSON: " + request_json["tools"].dump());
         } else {
-            debug_log("No tools in request");
+            log_debug("No tools in request");
         }
         
         // Handle model loading/switching
@@ -579,13 +586,13 @@ void Server::handle_chat_completions(const httplib::Request& req, httplib::Respo
             try {
                 auto_load_model_if_needed(requested_model);
             } catch (const std::exception& e) {
-                std::cerr << "[Server ERROR] Failed to load model: " << e.what() << std::endl;
+                log_error("Failed to load model: " + std::string(e.what()));
                 res.status = 404;
                 res.set_content("{\"error\": \"" + std::string(e.what()) + "\"}", "application/json");
                 return;
             }
         } else if (!router_->is_model_loaded()) {
-            std::cerr << "[Server ERROR] No model loaded and no model specified in request" << std::endl;
+            log_error("No model loaded and no model specified in request");
             res.status = 400;
             res.set_content("{\"error\": \"No model loaded and no model specified in request\"}", "application/json");
             return;
@@ -629,9 +636,6 @@ void Server::handle_chat_completions(const httplib::Request& req, httplib::Respo
         
         if (is_streaming) {
             try {
-                // Log the HTTP request
-                std::cout << "[Server] POST /api/v1/chat/completions - Streaming" << std::endl;
-                
                 // Set up streaming response with SSE headers
                 res.set_header("Content-Type", "text/event-stream");
                 res.set_header("Cache-Control", "no-cache");
@@ -656,18 +660,14 @@ void Server::handle_chat_completions(const httplib::Request& req, httplib::Respo
                     }
                 );
             } catch (const std::exception& e) {
-                std::cerr << "[Server ERROR] Streaming failed: " << e.what() << std::endl;
+                log_error("Streaming failed: " + std::string(e.what()));
                 res.status = 500;
                 res.set_content("{\"error\":\"Internal server error during streaming\"}", "application/json");
             }
         } else {
-            // Log the HTTP request
-            std::cout << "[Server] POST /api/v1/chat/completions - ";
-            
+            log_info("POST /api/v1/chat/completions - Waiting for model to response...");
             auto response = router_->chat_completion(request_json);
-            
-            // Complete the log line with status
-            std::cout << "200 OK" << std::endl;
+            log_info("POST /api/v1/chat/completions - OK");
             
             // Debug: Check if response contains tool_calls
             if (response.contains("choices") && response["choices"].is_array() && !response["choices"].empty()) {
@@ -675,11 +675,11 @@ void Server::handle_chat_completions(const httplib::Request& req, httplib::Respo
                 if (first_choice.contains("message")) {
                     auto& message = first_choice["message"];
                     if (message.contains("tool_calls")) {
-                        debug_log("Response contains tool_calls: " + message["tool_calls"].dump());
+                        log_debug("Response contains tool_calls: " + message["tool_calls"].dump());
                     } else {
-                        debug_log("Response message does NOT contain tool_calls");
+                        log_debug("Response message does NOT contain tool_calls");
                         if (message.contains("content")) {
-                            debug_log("Message content: " + message["content"].get<std::string>().substr(0, 200));
+                            log_debug("Message content: " + message["content"].get<std::string>().substr(0, 200));
                         }
                     }
                 }
@@ -696,26 +696,28 @@ void Server::handle_chat_completions(const httplib::Request& req, httplib::Respo
                 double ttft_seconds = 0.0;
                 double tps = 0.0;
                 
-                std::cout << "\n=== Telemetry ===" << std::endl;
+                log_info("=== Telemetry ===");
                 if (timings.contains("prompt_n")) {
                     input_tokens = timings["prompt_n"].get<int>();
-                    std::cout << "Input tokens:  " << input_tokens << std::endl;
+                    log_info("Input tokens:  " + std::to_string(input_tokens));
                 }
                 if (timings.contains("predicted_n")) {
                     output_tokens = timings["predicted_n"].get<int>();
-                    std::cout << "Output tokens: " << output_tokens << std::endl;
+                    log_info("Output tokens: " + std::to_string(output_tokens));
                 }
                 if (timings.contains("prompt_ms")) {
                     ttft_seconds = timings["prompt_ms"].get<double>() / 1000.0;
-                    std::cout << "TTFT (s):      " << std::fixed << std::setprecision(2) 
-                             << ttft_seconds << std::endl;
+                    std::ostringstream msg;
+                    msg << "TTFT (s):      " << std::fixed << std::setprecision(2) << ttft_seconds;
+                    log_info(msg.str());
                 }
                 if (timings.contains("predicted_per_second")) {
                     tps = timings["predicted_per_second"].get<double>();
-                    std::cout << "TPS:           " << std::fixed << std::setprecision(2) 
-                             << tps << std::endl;
+                    std::ostringstream msg;
+                    msg << "TPS:           " << std::fixed << std::setprecision(2) << tps;
+                    log_info(msg.str());
                 }
-                std::cout << "=================" << std::endl;
+                log_info("=================");
                 
                 // Save telemetry to router
                 router_->update_telemetry(input_tokens, output_tokens, ttft_seconds, tps);
@@ -727,28 +729,30 @@ void Server::handle_chat_completions(const httplib::Request& req, httplib::Respo
                 double ttft_seconds = 0.0;
                 double tps = 0.0;
                 
-                std::cout << "\n=== Telemetry ===" << std::endl;
+                log_info("=== Telemetry ===");
                 if (usage.contains("prompt_tokens")) {
                     input_tokens = usage["prompt_tokens"].get<int>();
-                    std::cout << "Input tokens:  " << input_tokens << std::endl;
+                    log_info("Input tokens:  " + std::to_string(input_tokens));
                 }
                 if (usage.contains("completion_tokens")) {
                     output_tokens = usage["completion_tokens"].get<int>();
-                    std::cout << "Output tokens: " << output_tokens << std::endl;
+                    log_info("Output tokens: " + std::to_string(output_tokens));
                 }
                 
                 // FLM format may include timing data
                 if (usage.contains("prefill_duration_ttft")) {
                     ttft_seconds = usage["prefill_duration_ttft"].get<double>();
-                    std::cout << "TTFT (s):      " << std::fixed << std::setprecision(2) 
-                             << ttft_seconds << std::endl;
+                    std::ostringstream msg;
+                    msg << "TTFT (s):      " << std::fixed << std::setprecision(2) << ttft_seconds;
+                    log_info(msg.str());
                 }
                 if (usage.contains("decoding_speed_tps")) {
                     tps = usage["decoding_speed_tps"].get<double>();
-                    std::cout << "TPS:           " << std::fixed << std::setprecision(2) 
-                             << tps << std::endl;
+                    std::ostringstream msg;
+                    msg << "TPS:           " << std::fixed << std::setprecision(2) << tps;
+                    log_info(msg.str());
                 }
-                std::cout << "=================" << std::endl;
+                log_info("=================");
                 
                 // Save telemetry to router
                 router_->update_telemetry(input_tokens, output_tokens, ttft_seconds, tps);
@@ -765,7 +769,7 @@ void Server::handle_chat_completions(const httplib::Request& req, httplib::Respo
         }
         
     } catch (const std::exception& e) {
-        std::cerr << "[Server ERROR] Chat completion failed: " << e.what() << std::endl;
+        log_error("Chat completion failed: " + std::string(e.what()));
         res.status = 500;
         nlohmann::json error = {{"error", e.what()}};
         res.set_content(error.dump(), "application/json");
@@ -782,13 +786,13 @@ void Server::handle_completions(const httplib::Request& req, httplib::Response& 
             try {
                 auto_load_model_if_needed(requested_model);
             } catch (const std::exception& e) {
-                std::cerr << "[Server ERROR] Failed to load model: " << e.what() << std::endl;
+                log_error("Failed to load model: " + std::string(e.what()));
                 res.status = 404;
                 res.set_content("{\"error\": \"" + std::string(e.what()) + "\"}", "application/json");
                 return;
             }
         } else if (!router_->is_model_loaded()) {
-            std::cerr << "[Server ERROR] No model loaded and no model specified in request" << std::endl;
+            log_error("No model loaded and no model specified in request");
             res.status = 400;
             res.set_content("{\"error\": \"No model loaded and no model specified in request\"}", "application/json");
             return;
@@ -803,7 +807,7 @@ void Server::handle_completions(const httplib::Request& req, httplib::Response& 
         if (is_streaming) {
             try {
                 // Log the HTTP request
-                std::cout << "[Server] POST /api/v1/completions - Streaming" << std::endl;
+                log_info("POST /api/v1/completions - Streaming");
                 
                 // Set up SSE headers
                 res.set_header("Content-Type", "text/event-stream");
@@ -825,11 +829,11 @@ void Server::handle_completions(const httplib::Request& req, httplib::Response& 
                     }
                 );
                 
-                std::cout << "[Server] Streaming completed - 200 OK" << std::endl;
+                log_info("Streaming completed - 200 OK");
                 return;
                 
             } catch (const std::exception& e) {
-                std::cerr << "[Server ERROR] Streaming failed: " << e.what() << std::endl;
+                log_error("Streaming failed: " + std::string(e.what()));
                 res.status = 500;
                 res.set_content("{\"error\": \"" + std::string(e.what()) + "\"}", "application/json");
                 return;
@@ -840,7 +844,7 @@ void Server::handle_completions(const httplib::Request& req, httplib::Response& 
             
             // Check if response contains an error
             if (response.contains("error")) {
-                std::cerr << "[Server] ERROR: Backend returned error response: " << response["error"].dump() << std::endl;
+                log_error("Backend returned error response: " + response["error"].dump());
                 res.status = 500;
                 res.set_content(response.dump(), "application/json");
                 return;
@@ -848,7 +852,7 @@ void Server::handle_completions(const httplib::Request& req, httplib::Response& 
             
             // Verify response has required fields
             if (!response.contains("choices")) {
-                std::cerr << "[Server] ERROR: Response missing 'choices' field. Response: " << response.dump() << std::endl;
+                log_error("Response missing 'choices' field. Response: " + response.dump());
                 res.status = 500;
                 nlohmann::json error = {{"error", "Backend returned invalid response format"}};
                 res.set_content(error.dump(), "application/json");
@@ -865,26 +869,28 @@ void Server::handle_completions(const httplib::Request& req, httplib::Response& 
                 double ttft_seconds = 0.0;
                 double tps = 0.0;
                 
-                std::cout << "\n=== Telemetry ===" << std::endl;
+                log_info("=== Telemetry ===");
                 if (timings.contains("prompt_n")) {
                     input_tokens = timings["prompt_n"].get<int>();
-                    std::cout << "Input tokens:  " << input_tokens << std::endl;
+                    log_info("Input tokens:  " + std::to_string(input_tokens));
                 }
                 if (timings.contains("predicted_n")) {
                     output_tokens = timings["predicted_n"].get<int>();
-                    std::cout << "Output tokens: " << output_tokens << std::endl;
+                    log_info("Output tokens: " + std::to_string(output_tokens));
                 }
                 if (timings.contains("prompt_ms")) {
                     ttft_seconds = timings["prompt_ms"].get<double>() / 1000.0;
-                    std::cout << "TTFT (s):      " << std::fixed << std::setprecision(2) 
-                             << ttft_seconds << std::endl;
+                    std::ostringstream msg;
+                    msg << "TTFT (s):      " << std::fixed << std::setprecision(2) << ttft_seconds;
+                    log_info(msg.str());
                 }
                 if (timings.contains("predicted_per_second")) {
                     tps = timings["predicted_per_second"].get<double>();
-                    std::cout << "TPS:           " << std::fixed << std::setprecision(2) 
-                             << tps << std::endl;
+                    std::ostringstream msg;
+                    msg << "TPS:           " << std::fixed << std::setprecision(2) << tps;
+                    log_info(msg.str());
                 }
-                std::cout << "=================" << std::endl;
+                log_info("=================");
                 
                 // Save telemetry to router
                 router_->update_telemetry(input_tokens, output_tokens, ttft_seconds, tps);
@@ -895,28 +901,30 @@ void Server::handle_completions(const httplib::Request& req, httplib::Response& 
                 double ttft_seconds = 0.0;
                 double tps = 0.0;
                 
-                std::cout << "\n=== Telemetry ===" << std::endl;
+                log_info("=== Telemetry ===");
                 if (usage.contains("prompt_tokens")) {
                     input_tokens = usage["prompt_tokens"].get<int>();
-                    std::cout << "Input tokens:  " << input_tokens << std::endl;
+                    log_info("Input tokens:  " + std::to_string(input_tokens));
                 }
                 if (usage.contains("completion_tokens")) {
                     output_tokens = usage["completion_tokens"].get<int>();
-                    std::cout << "Output tokens: " << output_tokens << std::endl;
+                    log_info("Output tokens: " + std::to_string(output_tokens));
                 }
                 
                 // FLM format may include timing data
                 if (usage.contains("prefill_duration_ttft")) {
                     ttft_seconds = usage["prefill_duration_ttft"].get<double>();
-                    std::cout << "TTFT (s):      " << std::fixed << std::setprecision(2) 
-                             << ttft_seconds << std::endl;
+                    std::ostringstream msg;
+                    msg << "TTFT (s):      " << std::fixed << std::setprecision(2) << ttft_seconds;
+                    log_info(msg.str());
                 }
                 if (usage.contains("decoding_speed_tps")) {
                     tps = usage["decoding_speed_tps"].get<double>();
-                    std::cout << "TPS:           " << std::fixed << std::setprecision(2) 
-                             << tps << std::endl;
+                    std::ostringstream msg;
+                    msg << "TPS:           " << std::fixed << std::setprecision(2) << tps;
+                    log_info(msg.str());
                 }
-                std::cout << "=================" << std::endl;
+                log_info("=================");
                 
                 // Save telemetry to router
                 router_->update_telemetry(input_tokens, output_tokens, ttft_seconds, tps);
@@ -933,7 +941,7 @@ void Server::handle_completions(const httplib::Request& req, httplib::Response& 
         }
         
     } catch (const std::exception& e) {
-        std::cerr << "[Server] ERROR in handle_completions: " << e.what() << std::endl;
+        log_error("ERROR in handle_completions: " + std::string(e.what()));
         res.status = 500;
         nlohmann::json error = {{"error", e.what()}};
         res.set_content(error.dump(), "application/json");
@@ -949,7 +957,7 @@ void Server::handle_embeddings(const httplib::Request& req, httplib::Response& r
             std::string requested_model = request_json["model"];
             auto_load_model_if_needed(requested_model);
         } else if (!router_->is_model_loaded()) {
-            std::cerr << "[Server ERROR] No model loaded and no model specified in request" << std::endl;
+            log_error("No model loaded and no model specified in request");
             res.status = 400;
             res.set_content("{\"error\": \"No model loaded and no model specified in request\"}", "application/json");
             return;
@@ -960,7 +968,7 @@ void Server::handle_embeddings(const httplib::Request& req, httplib::Response& r
         res.set_content(response.dump(), "application/json");
         
     } catch (const std::exception& e) {
-        std::cerr << "[Server] ERROR in handle_embeddings: " << e.what() << std::endl;
+        log_error("ERROR in handle_embeddings: " + std::string(e.what()));
         res.status = 500;
         nlohmann::json error = {{"error", e.what()}};
         res.set_content(error.dump(), "application/json");
@@ -976,7 +984,7 @@ void Server::handle_reranking(const httplib::Request& req, httplib::Response& re
             std::string requested_model = request_json["model"];
             auto_load_model_if_needed(requested_model);
         } else if (!router_->is_model_loaded()) {
-            std::cerr << "[Server ERROR] No model loaded and no model specified in request" << std::endl;
+            log_error("No model loaded and no model specified in request");
             res.status = 400;
             res.set_content("{\"error\": \"No model loaded and no model specified in request\"}", "application/json");
             return;
@@ -987,7 +995,7 @@ void Server::handle_reranking(const httplib::Request& req, httplib::Response& re
         res.set_content(response.dump(), "application/json");
         
     } catch (const std::exception& e) {
-        std::cerr << "[Server] ERROR in handle_reranking: " << e.what() << std::endl;
+        log_error("ERROR in handle_reranking: " + std::string(e.what()));
         res.status = 500;
         nlohmann::json error = {{"error", e.what()}};
         res.set_content(error.dump(), "application/json");
@@ -1003,7 +1011,7 @@ void Server::handle_responses(const httplib::Request& req, httplib::Response& re
             std::string requested_model = request_json["model"];
             auto_load_model_if_needed(requested_model);
         } else if (!router_->is_model_loaded()) {
-            std::cerr << "[Server ERROR] No model loaded and no model specified in request" << std::endl;
+            log_error("No model loaded and no model specified in request");
             res.status = 400;
             res.set_content("{\"error\": \"No model loaded and no model specified in request\"}", "application/json");
             return;
@@ -1012,7 +1020,7 @@ void Server::handle_responses(const httplib::Request& req, httplib::Response& re
         // Check if current model supports responses API (only oga-* recipes)
         std::string loaded_recipe = router_->get_loaded_recipe();
         if (loaded_recipe.find("oga-") == std::string::npos && loaded_recipe != "oga") {
-            std::cerr << "[Server ERROR] Responses API not supported for recipe: " << loaded_recipe << std::endl;
+            log_error("Responses API not supported for recipe: " + loaded_recipe);
             res.status = 422;
             nlohmann::json error_response = {
                 {"error", {
@@ -1030,7 +1038,7 @@ void Server::handle_responses(const httplib::Request& req, httplib::Response& re
         
         if (is_streaming) {
             try {
-                std::cout << "[Server] POST /api/v1/responses - Streaming" << std::endl;
+                log_info("POST /api/v1/responses - Streaming");
                 
                 // Set up streaming response with SSE headers
                 res.set_header("Content-Type", "text/event-stream");
@@ -1053,21 +1061,21 @@ void Server::handle_responses(const httplib::Request& req, httplib::Response& re
                     }
                 );
             } catch (const std::exception& e) {
-                std::cerr << "[Server ERROR] Streaming failed: " << e.what() << std::endl;
+                log_error("Streaming failed: " + std::string(e.what()));
                 res.status = 500;
                 res.set_content("{\"error\":\"Internal server error during streaming\"}", "application/json");
             }
         } else {
-            std::cout << "[Server] POST /api/v1/responses - Non-streaming" << std::endl;
+            log_info("POST /api/v1/responses - Non-streaming");
             
             auto response = router_->responses(request_json);
             
-            std::cout << "200 OK" << std::endl;
+            log_info("POST /api/v1/responses - Non-streaming 200 OK");
             res.set_content(response.dump(), "application/json");
         }
         
     } catch (const std::exception& e) {
-        std::cerr << "[Server] ERROR in handle_responses: " << e.what() << std::endl;
+        log_error("ERROR in handle_responses: " + std::string(e.what()));
         res.status = 500;
         nlohmann::json error = {{"error", e.what()}};
         res.set_content(error.dump(), "application/json");
@@ -1092,12 +1100,12 @@ void Server::handle_pull(const httplib::Request& req, httplib::Response& res) {
         std::string mmproj = request_json.value("mmproj", "");
         bool do_not_upgrade = request_json.value("do_not_upgrade", false);
         
-        std::cout << "[Server] Pulling model: " << model_name << std::endl;
+        log_info("Pulling model: " + model_name);
         if (!checkpoint.empty()) {
-            std::cout << "[Server]   checkpoint: " << checkpoint << std::endl;
+            log_info("  checkpoint: " + checkpoint);
         }
         if (!recipe.empty()) {
-            std::cout << "[Server]   recipe: " << recipe << std::endl;
+            log_info("  recipe: " + recipe);
         }
         
         model_manager_->download_model(model_name, checkpoint, recipe, 
@@ -1107,7 +1115,7 @@ void Server::handle_pull(const httplib::Request& req, httplib::Response& res) {
         res.set_content(response.dump(), "application/json");
         
     } catch (const std::exception& e) {
-        std::cerr << "[Server] ERROR in handle_pull: " << e.what() << std::endl;
+        log_error("ERROR in handle_pull: " + std::string(e.what()));
         res.status = 500;
         nlohmann::json error = {{"error", e.what()}};
         res.set_content(error.dump(), "application/json");
@@ -1118,8 +1126,7 @@ void Server::handle_load(const httplib::Request& req, httplib::Response& res) {
     auto thread_id = std::this_thread::get_id();
     std::ostringstream oss;
     oss << "===== LOAD ENDPOINT ENTERED (Thread: " << thread_id << ") =====";
-    debug_log(oss.str());
-    std::cout.flush();
+    log_debug(oss.str());
     try {
         auto request_json = nlohmann::json::parse(req.body);
         std::string model_name = request_json["model_name"];
@@ -1129,16 +1136,17 @@ void Server::handle_load(const httplib::Request& req, httplib::Response& res) {
         std::string llamacpp_backend = request_json.value("llamacpp_backend", "");
         std::string llamacpp_args = request_json.value("llamacpp_args", "");
         
-        std::cout << "[Server] Loading model: " << model_name;
-        if (ctx_size > 0) std::cout << " (ctx_size=" << ctx_size << ")";
-        if (!llamacpp_backend.empty()) std::cout << " (backend=" << llamacpp_backend << ")";
-        if (!llamacpp_args.empty()) std::cout << " (args=" << llamacpp_args << ")";
-        std::cout << std::endl;
+        std::ostringstream model_details;
+        model_details << model_name;
+        if (ctx_size > 0) model_details << " (ctx_size=" << ctx_size << ")";
+        if (!llamacpp_backend.empty()) model_details << " (backend=" << llamacpp_backend << ")";
+        if (!llamacpp_args.empty()) model_details << " (args=" << llamacpp_args << ")";
+        log_debug("Loading model: " + model_details.str());
         
         // Check if model is already loaded (early return optimization)
         std::string loaded_model = router_->get_loaded_model();
         if (loaded_model == model_name) {
-            std::cout << "[Server] Model already loaded: " << model_name << std::endl;
+            log_info("Model already loaded: " + model_name);
             auto info = model_manager_->get_model_info(model_name);
             nlohmann::json response = {
                 {"status", "success"},
@@ -1160,7 +1168,7 @@ void Server::handle_load(const httplib::Request& req, httplib::Response& res) {
         
         // Download model if needed (first-time use)
         if (!info.downloaded) {
-            std::cout << "[Server] Model not downloaded, downloading..." << std::endl;
+            log_info("Model not downloaded, downloading...");
             model_manager_->download_model(model_name);
             info = model_manager_->get_model_info(model_name);
         }
@@ -1178,7 +1186,7 @@ void Server::handle_load(const httplib::Request& req, httplib::Response& res) {
         res.set_content(response.dump(), "application/json");
         
     } catch (const std::exception& e) {
-        std::cerr << "[Server ERROR] Failed to load model: " << e.what() << std::endl;
+        log_error("Failed to load model: " + std::string(e.what()));
         res.status = 500;
         nlohmann::json error = {{"error", e.what()}};
         res.set_content(error.dump(), "application/json");
@@ -1187,9 +1195,9 @@ void Server::handle_load(const httplib::Request& req, httplib::Response& res) {
 
 void Server::handle_unload(const httplib::Request& req, httplib::Response& res) {
     try {
-        std::cout << "[Server] Unload request received" << std::endl;
-        std::cout << "[Server] Request method: " << req.method << ", body length: " << req.body.length() << std::endl;
-        std::cout << "[Server] Content-Type: " << req.get_header_value("Content-Type") << std::endl;
+        log_info("Unload request received");
+        log_info("Request method: " + req.method + ", body length: " + std::to_string(req.body.length()));
+        log_info("Content-Type: " + req.get_header_value("Content-Type"));
         
         // Multi-model support: Optional model_name parameter
         std::string model_name;
@@ -1209,7 +1217,7 @@ void Server::handle_unload(const httplib::Request& req, httplib::Response& res) 
         router_->unload_model(model_name);  // Empty string = unload all
         
         if (model_name.empty()) {
-            std::cout << "[Server] All models unloaded successfully" << std::endl;
+            log_info("All models unloaded successfully");
             nlohmann::json response = {
                 {"status", "success"},
                 {"message", "All models unloaded successfully"}
@@ -1217,7 +1225,7 @@ void Server::handle_unload(const httplib::Request& req, httplib::Response& res) 
             res.status = 200;
             res.set_content(response.dump(), "application/json");
         } else {
-            std::cout << "[Server] Model '" << model_name << "' unloaded successfully" << std::endl;
+            log_info("Model '" + model_name + "' unloaded successfully");
             nlohmann::json response = {
                 {"status", "success"},
                 {"message", "Model unloaded successfully"},
@@ -1227,7 +1235,7 @@ void Server::handle_unload(const httplib::Request& req, httplib::Response& res) 
             res.set_content(response.dump(), "application/json");
         }
     } catch (const std::exception& e) {
-        std::cerr << "[Server ERROR] Unload failed: " << e.what() << std::endl;
+        log_error("[Server ERROR] Unload failed: " + std::string(e.what()));
         
         // Check if error is "Model not loaded" for 404
         std::string error_msg = e.what();
@@ -1250,7 +1258,7 @@ void Server::handle_delete(const httplib::Request& req, httplib::Response& res) 
             request_json["model"].get<std::string>() : 
             request_json["model_name"].get<std::string>();
         
-        std::cout << "[Server] Deleting model: " << model_name << std::endl;
+        log_info("Deleting model: " + model_name);
         model_manager_->delete_model(model_name);
         
         nlohmann::json response = {
@@ -1260,7 +1268,7 @@ void Server::handle_delete(const httplib::Request& req, httplib::Response& res) 
         res.set_content(response.dump(), "application/json");
         
     } catch (const std::exception& e) {
-        std::cerr << "[Server] ERROR in handle_delete: " << e.what() << std::endl;
+        log_error("ERROR in handle_delete: " + std::string(e.what()));
         
         // Check if this is a "Model not found" error (return 422)
         std::string error_msg = e.what();
@@ -1282,7 +1290,7 @@ void Server::handle_params(const httplib::Request& req, httplib::Response& res) 
         nlohmann::json response = {{"status", "success"}};
         res.set_content(response.dump(), "application/json");
     } catch (const std::exception& e) {
-        std::cerr << "[Server] ERROR in handle_params: " << e.what() << std::endl;
+        log_error("ERROR in handle_params: " + std::string(e.what()));
         res.status = 500;
         nlohmann::json error = {{"error", e.what()}};
         res.set_content(error.dump(), "application/json");
@@ -1291,7 +1299,7 @@ void Server::handle_params(const httplib::Request& req, httplib::Response& res) 
 
 void Server::handle_add_local_model(const httplib::Request& req, httplib::Response& res) {
     try {
-        std::cout << "[Server] Add local model request received" << std::endl;
+        log_info("Add local model request received");
         
         // Validate that this is a multipart form request
         if (!req.is_multipart_form_data()) {
@@ -1341,9 +1349,9 @@ void Server::handle_add_local_model(const httplib::Request& req, httplib::Respon
             reranking = (reranking_str == "true" || reranking_str == "True" || reranking_str == "1");
         }
         
-        std::cout << "[Server] Model name: " << model_name << std::endl;
-        std::cout << "[Server] Recipe: " << recipe << std::endl;
-        std::cout << "[Server] Checkpoint: " << checkpoint << std::endl;
+        log_info("Model name: " + model_name);
+        log_info("Recipe: " + recipe);
+        log_info("Checkpoint: " + checkpoint);
         
         // Validate required fields
         if (model_name.empty() || recipe.empty()) {
@@ -1416,7 +1424,7 @@ void Server::handle_add_local_model(const httplib::Request& req, httplib::Respon
         std::replace(repo_cache_name.begin(), repo_cache_name.end(), '/', '-');
         
         std::string snapshot_path = hf_cache + "/models--" + repo_cache_name;
-        std::cout << "[Server] Creating directory: " << snapshot_path << std::endl;
+        log_info("Creating directory: " + snapshot_path);
         
         // Create directories
         std::filesystem::create_directories(snapshot_path);
@@ -1429,7 +1437,7 @@ void Server::handle_add_local_model(const httplib::Request& req, httplib::Respon
         }
         
         // Save uploaded files
-        std::cout << "[Server] Saving " << files.size() << " uploaded files..." << std::endl;
+        log_info("Saving " + std::to_string(files.size()) + " uploaded files...");
         for (const auto& file_pair : files) {
             // Skip form fields (model_name, recipe, etc.)
             if (file_pair.first != "model_files") {
@@ -1438,7 +1446,7 @@ void Server::handle_add_local_model(const httplib::Request& req, httplib::Respon
             
             const auto& file = file_pair.second;
             std::string filename = file.filename;
-            std::cout << "[Server]   Processing file: " << filename << std::endl;
+            log_info("Processing file: " + filename);
             
             // Extract relative path from filename (browser sends folder/file.ext)
             std::string file_path;
@@ -1463,7 +1471,7 @@ void Server::handle_add_local_model(const httplib::Request& req, httplib::Respon
             out.write(file.content.c_str(), file.content.size());
             out.close();
             
-            std::cout << "[Server]     Saved to: " << file_path << std::endl;
+            log_info("    Saved to: " + file_path);
         }
         
         // Resolve actual file paths after upload
@@ -1541,7 +1549,7 @@ void Server::handle_add_local_model(const httplib::Request& req, httplib::Respon
             checkpoint_to_register = "models--" + repo_cache_name;
         }
         
-        std::cout << "[Server] Registering model with checkpoint: " << checkpoint_to_register << std::endl;
+        log_info("Registering model with checkpoint: " + checkpoint_to_register);
         
         // Register the model with source="local_upload" to mark it as locally uploaded
         model_manager_->register_user_model(
@@ -1556,7 +1564,7 @@ void Server::handle_add_local_model(const httplib::Request& req, httplib::Respon
             "local_upload"
         );
         
-        std::cout << "[Server] Model registered successfully" << std::endl;
+        log_info("Model registered successfully");
         
         nlohmann::json response = {
             {"status", "success"},
@@ -1565,7 +1573,7 @@ void Server::handle_add_local_model(const httplib::Request& req, httplib::Respon
         res.set_content(response.dump(), "application/json");
         
     } catch (const std::exception& e) {
-        std::cerr << "[Server] ERROR in handle_add_local_model: " << e.what() << std::endl;
+        log_error("ERROR in handle_add_local_model: " + std::string(e.what()));
         res.status = 500;
         nlohmann::json error = {{"error", "Failed to upload model: " + std::string(e.what())}};
         res.set_content(error.dump(), "application/json");
@@ -1583,7 +1591,7 @@ void Server::handle_stats(const httplib::Request& req, httplib::Response& res) {
         auto stats = router_->get_stats();
         res.set_content(stats.dump(), "application/json");
     } catch (const std::exception& e) {
-        std::cerr << "[Server] ERROR in handle_stats: " << e.what() << std::endl;
+        log_error("ERROR in handle_stats: " + std::string(e.what()));
         res.status = 500;
         nlohmann::json error = {{"error", e.what()}};
         res.set_content(error.dump(), "application/json");
@@ -1612,7 +1620,7 @@ void Server::handle_system_info(const httplib::Request& req, httplib::Response& 
         res.set_content(system_info.dump(), "application/json");
         
     } catch (const std::exception& e) {
-        std::cerr << "[Server] ERROR in handle_system_info: " << e.what() << std::endl;
+        log_error("ERROR in handle_system_info: " + std::string(e.what()));
         res.status = 500;
         nlohmann::json error = {{"error", e.what()}};
         res.set_content(error.dump(), "application/json");
@@ -1627,7 +1635,7 @@ void Server::handle_log_level(const httplib::Request& req, httplib::Response& re
         nlohmann::json response = {{"status", "success"}, {"level", log_level_}};
         res.set_content(response.dump(), "application/json");
     } catch (const std::exception& e) {
-        std::cerr << "[Server] ERROR in handle_log_level: " << e.what() << std::endl;
+        log_error("ERROR in handle_log_level: " + std::string(e.what()));
         res.status = 500;
         nlohmann::json error = {{"error", e.what()}};
         res.set_content(error.dump(), "application/json");
@@ -1635,7 +1643,7 @@ void Server::handle_log_level(const httplib::Request& req, httplib::Response& re
 }
 
 void Server::handle_shutdown(const httplib::Request& req, httplib::Response& res) {
-    std::cout << "[Server] Shutdown request received" << std::endl;
+    log_info("Shutdown request received");
     
     nlohmann::json response = {{"status", "shutting down"}};
     res.set_content(response.dump(), "application/json");
@@ -1643,29 +1651,24 @@ void Server::handle_shutdown(const httplib::Request& req, httplib::Response& res
     // Stop the server asynchronously to allow response to be sent
     std::thread([this]() {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        std::cout << "[Server] Stopping server..." << std::endl;
-        std::cout.flush();
+        log_info("Stopping server...");
         stop();
         
         // Graceful shutdown with timeout: explicitly unload models and stop backend servers
         if (router_) {
-            std::cout << "[Server] Unloading models and stopping backend servers..." << std::endl;
-            std::cout.flush();
+            log_info("Unloading models and stopping backend servers...");
             
             // Just call unload_model directly - keep it simple
             try {
                 router_->unload_model();
-                std::cout << "[Server] Cleanup completed successfully" << std::endl;
-                std::cout.flush();
+                log_info("Cleanup completed successfully");
             } catch (const std::exception& e) {
-                std::cerr << "[Server] Error during unload: " << e.what() << std::endl;
-                std::cerr.flush();
+                log_error("Error during unload: " + std::string(e.what()));
             }
         }
         
         // Force process exit - just use standard exit()
-        std::cout << "[Server] Calling exit(0)..." << std::endl;
-        std::cout.flush();
+        log_info("Calling exit(0)...");
         std::exit(0);
     }).detach();
 }
@@ -1673,8 +1676,8 @@ void Server::handle_shutdown(const httplib::Request& req, httplib::Response& res
 void Server::handle_logs_stream(const httplib::Request& req, httplib::Response& res) {
     // Check if log file exists
     if (log_file_path_.empty() || !std::filesystem::exists(log_file_path_)) {
-        std::cerr << "[Server] Log file not found: " << log_file_path_ << std::endl;
-        std::cerr << "[Server] Note: Log streaming only works when server is launched via tray/ServerManager" << std::endl;
+        log_error("Log file not found: " + log_file_path_);
+        log_error("Note: Log streaming only works when server is launched via tray/ServerManager");
         res.status = 404;
         nlohmann::json error = {
             {"error", "Log file not found. Log streaming requires server to be launched via tray application."},
@@ -1685,7 +1688,7 @@ void Server::handle_logs_stream(const httplib::Request& req, httplib::Response& 
         return;
     }
     
-    std::cout << "[Server] Starting log stream for: " << log_file_path_ << std::endl;
+    log_info("Starting log stream for: " + log_file_path_);
     
     // Set SSE headers
     res.set_header("Content-Type", "text/event-stream");
@@ -1709,7 +1712,7 @@ void Server::handle_logs_stream(const httplib::Request& req, httplib::Response& 
                 );
                 
                 if (!log_stream->is_open()) {
-                    std::cerr << "[Server] Failed to open log file for streaming" << std::endl;
+                    log_error("Failed to open log file for streaming");
                     return false;
                 }
                 
@@ -1717,7 +1720,7 @@ void Server::handle_logs_stream(const httplib::Request& req, httplib::Response& 
                 log_stream->seekg(0, std::ios::beg);
                 last_pos = 0;
                 
-                std::cout << "[Server] Log stream connection opened" << std::endl;
+                log_info("Log stream connection opened");
             }
             
             // Seek to last known position
@@ -1733,7 +1736,7 @@ void Server::handle_logs_stream(const httplib::Request& req, httplib::Response& 
                 std::string sse_msg = "data: " + line + "\n\n";
                 
                 if (!sink.write(sse_msg.c_str(), sse_msg.length())) {
-                    std::cout << "[Server] Log stream client disconnected" << std::endl;
+                    log_info("Log stream client disconnected");
                     return false;  // Client disconnected
                 }
                 
@@ -1752,7 +1755,7 @@ void Server::handle_logs_stream(const httplib::Request& req, httplib::Response& 
             if (!sent_data) {
                 const char* heartbeat = ": heartbeat\n\n";
                 if (!sink.write(heartbeat, strlen(heartbeat))) {
-                    std::cout << "[Server] Log stream client disconnected during heartbeat" << std::endl;
+                    log_info("Log stream client disconnected during heartbeat");
                     return false;
                 }
             }

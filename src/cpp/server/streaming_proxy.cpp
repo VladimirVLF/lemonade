@@ -16,6 +16,8 @@ void StreamingProxy::forward_sse_stream(
     bool stream_error = false;
     bool has_done_marker = false;
     
+    std::cout << "[StreamingProxy] Streaming..." << std::endl;
+
     // Use HttpClient to stream from backend
     auto result = utils::HttpClient::post_stream(
         backend_url,
@@ -57,7 +59,7 @@ void StreamingProxy::forward_sse_stream(
         // Explicitly flush and signal completion
         sink.done();
         
-        std::cout << "[Server] Streaming completed - 200 OK" << std::endl;
+        std::cout << "[StreamingProxy] Streaming completed" << std::endl;
         
         // Parse telemetry from buffered data
         auto telemetry = parse_telemetry(telemetry_buffer);
